@@ -23,6 +23,8 @@
 			"extensions": [
 				"eamodio.gitlens",
 				"streetsidesoftware.code-spell-checker",
+				"ms-azuretools.vscode-docker",
+				"github.vscode-github-actions"
 			]
 		}
 	},
