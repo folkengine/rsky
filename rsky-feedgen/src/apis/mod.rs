@@ -1039,6 +1039,7 @@ mod tests {
     use rocket::{routes, Build, Rocket};
     use std::env;
     use temp_env::async_with_vars;
+    use crate::ReadReplicaConn1;
 
     fn before(config: FeedGenConfig) -> Rocket<Build> {
         // Initialize Rocket with ReadReplicaConn and other necessary fairings/routes
@@ -1064,7 +1065,7 @@ mod tests {
 
         rocket::custom(figment)
             .attach(WriteDbConn::fairing())
-            .attach(ReadReplicaConn::fairing())
+            .attach(ReadReplicaConn1::fairing())
             .mount("/", routes![index])
             .manage(config)
     }
