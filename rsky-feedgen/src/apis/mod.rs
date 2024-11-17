@@ -568,17 +568,17 @@ pub async fn queue_creation(
                         quote_uri: None,
                         created_at: format!("{}", dt.format("%+")), // use now() as a default
                     };
-                    // If posts are received out of order, use indexed_at
-                    // mainly capturing created_at for back_dated posts
-                    if new_post.created_at > new_post.indexed_at {
-                        new_post.created_at = new_post.indexed_at.clone();
-                    }
 
                     if let Lexicon::AppBskyFeedPost(post_record) = req.record {
                         post_text_original = post_record.text.clone();
                         post_text = post_record.text.to_lowercase();
                         let post_created_at = format!("{}", post_record.created_at.format("%+"));
                         new_post.created_at = post_created_at.clone();
+                        // If posts are received out of order, use indexed_at
+                        // mainly capturing created_at for back_dated posts
+                        if new_post.created_at > new_post.indexed_at {
+                            new_post.created_at = new_post.indexed_at.clone();
+                        }
                         if let Some(reply) = post_record.reply {
                             root_author = reply.root.uri[5..37].into();
                             new_post.reply_parent = Some(reply.parent.uri);
@@ -995,6 +995,21 @@ pub fn add_visitor(
         .values(&new_visitor)
         .execute(connection)?;
     Ok(())
+}
+
+pub fn is_banned_from_tv(subject: &String) -> Result<bool, Box<dyn std::error::Error>> {
+    use crate::schema::banned_from_tv::dsl::*;
+
+    let connection = &mut establish_connection()?;
+
+    let subject_to_check = subject.clone();
+    let count = banned_from_tv
+        .filter(did.eq(subject_to_check))
+        .count()
+        .get_result(connection)
+        .unwrap_or(0);
+
+    return if count > 0 { Ok(true) } else { Ok(false) };
 }
 
 pub async fn get_cursor(
