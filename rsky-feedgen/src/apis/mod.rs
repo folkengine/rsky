@@ -980,7 +980,7 @@ pub fn add_visitor(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use crate::schema::visitor::dsl::*;
 
-    let connection = &mut establish_connection()?;
+    let connection = &mut Database::new().establish_connection()?;
 
     let system_time = SystemTime::now();
     let dt: DateTime<UtcOffset> = system_time.into();
@@ -1000,7 +1000,7 @@ pub fn add_visitor(
 pub fn is_banned_from_tv(subject: &String) -> Result<bool, Box<dyn std::error::Error>> {
     use crate::schema::banned_from_tv::dsl::*;
 
-    let connection = &mut establish_connection()?;
+    let connection = &mut RealDatabase::establish_connection()?;
 
     let subject_to_check = subject.clone();
     let count = banned_from_tv
