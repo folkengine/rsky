@@ -1,16 +1,22 @@
+use crate::common::env::env_int;
 use crate::db::*;
 use crate::explicit_slurs::contains_explicit_slurs;
+use crate::models::create_request::CreateRecord;
+use crate::models::Lexicon::{AppBskyFeedFollow, AppBskyFeedLike, AppBskyFeedPost};
 use crate::models::*;
 use crate::{FeedGenConfig, ReadReplicaConn, WriteDbConn};
 use chrono::offset::Utc as UtcOffset;
 use chrono::{DateTime, Duration, NaiveDateTime, Utc};
+use diesel::dsl::sql;
 use diesel::prelude::*;
 use diesel::sql_query;
+use diesel::sql_types::{Array, Bool, Nullable, Text};
 use once_cell::sync::Lazy;
 use rand::Rng;
 use regex::Regex;
 use rocket::State;
 use rsky_lexicon::app::bsky::embed::{Embeds, MediaUnion};
+use rsky_lexicon::app::bsky::feed::PostLabels;
 use std::collections::HashSet;
 use std::fmt::Write;
 use std::time::SystemTime;
@@ -22,10 +28,18 @@ pub async fn get_posts_by_membership(
     params_cursor: Option<&str>,
     only_posts: bool,
     list: String,
+    hashtags: Vec<String>,
     connection: ReadReplicaConn,
+    config: &State<FeedGenConfig>,
 ) -> Result<AlgoResponse, ValidationErrorMessageResponse> {
     use crate::schema::membership::dsl as MembershipSchema;
     use crate::schema::post::dsl as PostSchema;
+    use diesel::dsl::any;
+
+    let show_sponsored_post = config.show_sponsored_post.clone();
+    let sponsored_post_uri = config.sponsored_post_uri.clone();
+    let sponsored_post_probability = config.sponsored_post_probability.clone();
+
     let params_cursor = match params_cursor {
         None => None,
         Some(params_cursor) => Some(params_cursor.to_string()),
@@ -33,10 +47,10 @@ pub async fn get_posts_by_membership(
     let result = connection
         .run(move |conn| {
             let mut query = PostSchema::post
-                .inner_join(
+                .left_join(
                     MembershipSchema::membership.on(PostSchema::author
                         .eq(MembershipSchema::did)
-                        .and(MembershipSchema::list.eq(list))
+                        .and(MembershipSchema::list.eq(list.clone()))
                         .and(MembershipSchema::included.eq(true))),
                 )
                 .limit(limit.unwrap_or(30))
@@ -48,8 +62,7 @@ pub async fn get_posts_by_membership(
                 query = query.filter(PostSchema::lang.like(format!("%{}%", lang)));
             }
 
-            if params_cursor.is_some() {
-                let cursor_str = params_cursor.unwrap();
+            if let Some(cursor_str) = params_cursor {
                 let v = cursor_str
                     .split("::")
                     .take(2)
@@ -89,6 +102,23 @@ pub async fn get_posts_by_membership(
                     .filter(PostSchema::replyParent.is_null())
                     .filter(PostSchema::replyRoot.is_null());
             }
+
+            // Adjust the filtering logic
+            if hashtags.is_empty() {
+                // No hashtags provided, include only posts where author is in the list
+                query = query.filter(MembershipSchema::did.is_not_null());
+            } else {
+                let hashtag_patterns: Vec<String> = hashtags
+                    .iter()
+                    .map(|hashtag| format!("%#{}%", hashtag))
+                    .collect();
+                query = query.filter(
+                    MembershipSchema::did
+                        .is_not_null()
+                        .or(PostSchema::text.ilike(any(hashtag_patterns))),
+                );
+            }
+
             let results = query.load(conn).expect("Error loading post records");
 
             let mut post_results = Vec::new();
@@ -114,107 +144,23 @@ pub async fn get_posts_by_membership(
                 })
                 .for_each(drop);
 
-            let new_response = AlgoResponse {
-                cursor,
-                feed: post_results,
-            };
-            Ok(new_response)
-        })
-        .await;
+            // Insert the sponsored post if the conditions are met
+            if show_sponsored_post && post_results.len() >= 3 && !sponsored_post_uri.is_empty() {
+                // Generate a random chance to include the sponsored post based on probability
+                let mut rng = rand::thread_rng();
+                let random_chance: f64 = rng.gen();
 
-    result
-}
+                // Only include the sponsored post if random chance is below the specified probability
+                if random_chance < sponsored_post_probability {
+                    // Generate a random index to insert the sponsored post (ensure it's not the last position)
+                    let replace_index = rng.gen_range(0..(post_results.len() - 1));
 
-#[allow(deprecated)]
-pub async fn get_blacksky_nsfw(
-    limit: Option<i64>,
-    params_cursor: Option<&str>,
-    connection: ReadReplicaConn,
-) -> Result<AlgoResponse, ValidationErrorMessageResponse> {
-    use crate::schema::image::dsl as ImageSchema;
-    use crate::schema::post::dsl as PostSchema;
-    let params_cursor = match params_cursor {
-        None => None,
-        Some(params_cursor) => Some(params_cursor.to_string()),
-    };
-    let result = connection
-        .run(move |conn| {
-            let mut query = PostSchema::post
-                .limit(limit.unwrap_or(30))
-                .select(Post::as_select())
-                .order((PostSchema::createdAt.desc(), PostSchema::cid.desc()))
-                .into_boxed();
-
-            query = query.filter(
-                PostSchema::cid.eq_any(
-                    ImageSchema::image
-                        .filter(ImageSchema::labels.contains(vec!["sexy"]))
-                        .filter(ImageSchema::alt.is_not_null())
-                        .select(ImageSchema::postCid),
-                ),
-            );
-
-            if params_cursor.is_some() {
-                let cursor_str = params_cursor.unwrap();
-                let v = cursor_str
-                    .split("::")
-                    .take(2)
-                    .map(String::from)
-                    .collect::<Vec<_>>();
-                if let [created_at_c, cid_c] = &v[..] {
-                    if let Ok(timestamp) = created_at_c.parse::<i64>() {
-                        let nanoseconds = 230 * 1000000;
-                        let datetime = DateTime::<Utc>::from_utc(
-                            NaiveDateTime::from_timestamp(timestamp / 1000, nanoseconds),
-                            Utc,
-                        );
-                        let mut timestr = String::new();
-                        match write!(timestr, "{}", datetime.format("%+")) {
-                            Ok(_) => {
-                                query = query.filter(
-                                    PostSchema::createdAt.lt(timestr.to_owned()).or(
-                                        PostSchema::createdAt
-                                            .eq(timestr.to_owned())
-                                            .and(PostSchema::cid.lt(cid_c.to_owned())),
-                                    ),
-                                );
-                            }
-                            Err(error) => eprintln!("Error formatting: {error:?}"),
-                        }
-                    }
-                } else {
-                    let validation_error = ValidationErrorMessageResponse {
-                        code: Some(ErrorCode::ValidationError),
-                        message: Some("malformed cursor".into()),
+                    // Replace a random post with the sponsored post
+                    post_results[replace_index] = PostResult {
+                        post: sponsored_post_uri.clone(),
                     };
-                    return Err(validation_error);
                 }
             }
-
-            let results = query.load(conn).expect("Error loading post records");
-
-            let mut post_results = Vec::new();
-            let mut cursor: Option<String> = None;
-
-            // https://docs.rs/chrono/0.4.26/chrono/format/strftime/index.html
-            if let Some(last_post) = results.last() {
-                if let Ok(parsed_time) = NaiveDateTime::parse_from_str(&last_post.created_at, "%+")
-                {
-                    cursor = Some(format!(
-                        "{}::{}",
-                        parsed_time.timestamp_millis(),
-                        last_post.cid
-                    ));
-                }
-            }
-
-            results
-                .into_iter()
-                .map(|result| {
-                    let post_result = PostResult { post: result.uri };
-                    post_results.push(post_result);
-                })
-                .for_each(drop);
 
             let new_response = AlgoResponse {
                 cursor,
@@ -232,44 +178,66 @@ pub async fn get_blacksky_trending(
     limit: Option<i64>,
     params_cursor: Option<&str>,
     connection: ReadReplicaConn,
+    config: &State<FeedGenConfig>,
 ) -> Result<AlgoResponse, ValidationErrorMessageResponse> {
+    let trending_percentile_min = config.trending_percentile_min.clone();
+
     let params_cursor = match params_cursor {
         None => None,
         Some(params_cursor) => Some(params_cursor.to_string()),
     };
     let result = connection
         .run(move |conn| {
-            let dt = Utc::now() - Duration::days(2);
-            let mut query_str = format!("SELECT
-                hydrated.uri,
-                hydrated.cid,
-                hydrated.\"replyParent\",
-                hydrated.\"replyRoot\",
-                hydrated.trendingDate as \"indexedAt\",
-                hydrated.prev,
-                hydrated.\"sequence\",
-                hydrated.\"text\",
-                hydrated.lang,
-                hydrated.author,
-                hydrated.\"externalUri\",
-                hydrated.\"externalTitle\",
-                hydrated.\"externalDescription\",
-                hydrated.\"externalThumb\",
-                hydrated.\"quoteCid\",
-                hydrated.\"quoteUri\",
-                hydrated.\"createdAt\"
-            FROM(
+            let random_percentile = rand::thread_rng().gen_range(trending_percentile_min..=1.0);
+            let mut query_str = format!(
+                "WITH recent_posts AS (
                 SELECT
-                    post.*,
-                    twelfth.\"indexedAt\" as trendingDate 
+                    *
                 FROM post
-                JOIN (
-                    SELECT public.like.\"subjectUri\", public.like.\"indexedAt\", ROW_NUMBER() OVER (PARTITION BY public.like.\"subjectUri\" ORDER BY public.like.\"indexedAt\" NULLS LAST) AS RowNum FROM public.like
-                ) twelfth
-                    ON twelfth.\"subjectUri\" = post.uri
-                        and twelfth.RowNum = 12
-                WHERE post.\"indexedAt\" > '{0}'
-            ) hydrated", dt.format("%F"));
+                WHERE post.\"indexedAt\" >= (CURRENT_TIMESTAMP - INTERVAL '2 days')::text
+                    AND COALESCE(array_length(labels, 1), 0) = 0
+            ), recent_likes AS (
+                SELECT
+                    \"subjectUri\",
+                    COUNT(*) AS like_count
+                FROM public.like
+                WHERE public.like.\"indexedAt\" >= (CURRENT_TIMESTAMP - INTERVAL '24 hours')::text
+                GROUP BY \"subjectUri\"
+            ), posts_with_likes AS (
+                SELECT
+                    p.*,
+                    COALESCE(l.like_count, 0) AS like_count
+                FROM recent_posts p
+                LEFT JOIN recent_likes l ON l.\"subjectUri\" = p.uri
+            ), ranked_posts AS (
+                SELECT
+                    *,
+                    PERCENT_RANK() OVER (ORDER BY like_count) AS percentile_rank
+                FROM posts_with_likes
+            )
+            SELECT
+                uri,
+                cid,
+                \"replyParent\",
+                \"replyRoot\",
+                \"indexedAt\",
+                prev,
+                \"sequence\",
+                \"text\",
+                lang,
+                author,
+                \"externalUri\",
+                \"externalTitle\",
+                \"externalDescription\",
+                \"externalThumb\",
+                \"quoteCid\",
+                \"quoteUri\",
+                \"createdAt\",
+                labels
+            FROM ranked_posts
+            WHERE percentile_rank >= {:.4}",
+                random_percentile
+            );
 
             if params_cursor.is_some() {
                 let cursor_str = params_cursor.unwrap();
@@ -288,7 +256,14 @@ pub async fn get_blacksky_trending(
                         let mut timestr = String::new();
                         match write!(timestr, "{}", datetime.format("%+")) {
                             Ok(_) => {
-                                let cursor_filter_str = format!(" WHERE ((hydrated.trendingDate < '{0}') OR (hydrated.trendingDate = '{0}' AND hydrated.cid < '{1}'))", timestr.to_owned(), cid_c.to_owned());
+                                let cursor_filter_str = format!(
+                                    " AND (
+                                  (\"indexedAt\" < '{0}') OR
+                                  (\"indexedAt\" = '{0}' AND cid < '{1}')
+                              )",
+                                    timestr.to_owned(),
+                                    cid_c.to_owned()
+                                );
                                 query_str = format!("{}{}", query_str, cursor_filter_str);
                             }
                             Err(error) => eprintln!("Error formatting: {error:?}"),
@@ -302,7 +277,10 @@ pub async fn get_blacksky_trending(
                     return Err(validation_error);
                 }
             }
-            let order_str = format!(" ORDER BY hydrated.trendingDate DESC, hydrated.cid DESC LIMIT {} ", limit.unwrap_or(30));
+            let order_str = format!(
+                " ORDER BY \"indexedAt\" DESC, cid DESC LIMIT {} ",
+                limit.unwrap_or(30)
+            );
             let query_str = format!("{}{};", &query_str, &order_str);
 
             let results = sql_query(query_str)
@@ -353,6 +331,7 @@ pub async fn get_all_posts(
     config: &State<FeedGenConfig>,
 ) -> Result<AlgoResponse, ValidationErrorMessageResponse> {
     use crate::schema::post::dsl as PostSchema;
+
     let show_sponsored_post = config.show_sponsored_post.clone();
     let sponsored_post_uri = config.sponsored_post_uri.clone();
     let sponsored_post_probability = config.sponsored_post_probability.clone();
@@ -368,6 +347,7 @@ pub async fn get_all_posts(
                 .limit(limit.unwrap_or(30))
                 .select(Post::as_select())
                 .order((PostSchema::createdAt.desc(), PostSchema::cid.desc()))
+                .filter(sql::<Bool>("COALESCE(array_length(labels, 1), 0) = 0"))
                 .into_boxed();
 
             if let Some(lang) = lang {
@@ -409,6 +389,14 @@ pub async fn get_all_posts(
                     };
                     return Err(validation_error);
                 }
+            } else {
+                // Add a buffer for posts to be deleted; Current time and n minutes ago
+                let buffer_num = env_int("QUERY_BUFFER_MINS").unwrap_or(2) as i64;
+                let now = Utc::now();
+                let n_mins_ago = now - Duration::minutes(buffer_num);
+                // Format `buffer_num` as a string to compare with `character varying`
+                let n_mins_ago_str = n_mins_ago.to_rfc3339(); // Example: "2024-12-12T11:03:27.660+00:00"
+                query = query.filter(PostSchema::createdAt.le(n_mins_ago_str));
             }
             if only_posts {
                 query = query
@@ -472,21 +460,16 @@ pub async fn get_all_posts(
 pub fn is_included(
     dids: Vec<&String>,
     conn: &mut PgConnection,
-) -> Result<bool, Box<dyn std::error::Error>> {
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     use crate::schema::membership::dsl::*;
 
     let result = membership
         .filter(did.eq_any(dids))
         .filter(included.eq(true))
-        .limit(1)
         .select(Membership::as_select())
         .load(conn)?;
 
-    if result.len() > 0 {
-        Ok(result[0].included)
-    } else {
-        Ok(false)
-    }
+    Ok(result.into_iter().map(|m| m.list).collect::<Vec<String>>())
 }
 
 pub fn is_excluded(
@@ -542,8 +525,8 @@ pub async fn queue_creation(
                 .map(|req| {
                     let system_time = SystemTime::now();
                     let dt: DateTime<UtcOffset> = system_time.into();
-                    let mut root_author = String::new();
-                    let is_member = is_included(vec![&req.author].into(), conn).unwrap_or(false);
+                    // let mut root_author = String::new();
+                    let member_of = is_included(vec![&req.author].into(), conn).unwrap_or_else(|_| vec![]);
                     let is_blocked = is_excluded(vec![&req.author].into(), conn).unwrap_or(false);
                     let mut post_text = String::new();
                     let mut post_text_original = String::new();
@@ -567,9 +550,10 @@ pub async fn queue_creation(
                         quote_cid: None,
                         quote_uri: None,
                         created_at: format!("{}", dt.format("%+")), // use now() as a default
+                        labels: vec![]
                     };
 
-                    if let Lexicon::AppBskyFeedPost(post_record) = req.record {
+                    if let CreateRecord::Lexicon(AppBskyFeedPost(post_record)) = req.record {
                         post_text_original = post_record.text.clone();
                         post_text = post_record.text.to_lowercase();
                         let post_created_at = format!("{}", post_record.created_at.format("%+"));
@@ -580,12 +564,15 @@ pub async fn queue_creation(
                             new_post.created_at = new_post.indexed_at.clone();
                         }
                         if let Some(reply) = post_record.reply {
-                            root_author = reply.root.uri[5..37].into();
+                            //root_author = reply.root.uri[5..37].into();
                             new_post.reply_parent = Some(reply.parent.uri);
                             new_post.reply_root = Some(reply.root.uri);
                         }
                         if let Some(langs) = post_record.langs {
                             new_post.lang = Some(langs.join(","));
+                        }
+                        if let Some(PostLabels::SelfLabels(self_labels)) = post_record.labels {
+                            new_post.labels = self_labels.values.into_iter().map(|self_label| Some(self_label.val)).collect::<Vec<Option<String>>>();
                         }
                         if let Some(embed) = post_record.embed {
                             match embed {
@@ -639,6 +626,8 @@ pub async fn queue_creation(
                                     };
                                 }
                                 Embeds::RecordWithMedia(e) => {
+                                    new_post.quote_cid = Some(e.record.record.cid);
+                                    new_post.quote_uri = Some(e.record.record.uri);
                                     match e.media {
                                         MediaUnion::Images(m) => {
                                             for image in m.images {
@@ -721,19 +710,29 @@ pub async fn queue_creation(
 
                     let hashtags = extract_hashtags(&post_text);
                     new_post.text = Some(post_text_original.clone());
-                    if (is_member ||
+                    if (!member_of.is_empty() ||
                         hashtags.contains("#blacksky") ||
+                        hashtags.contains("#blackhairsky") ||
+                        hashtags.contains("#locsky") ||
+                        hashtags.contains("#blackbluesky") ||
                         hashtags.contains("#blacktechsky") ||
                         hashtags.contains("#nbablacksky") ||
-                        hashtags.contains("#addtoblacksky")) && 
+                        hashtags.contains("#addtoblacksky") ||
+                        hashtags.contains("#blackademics") ||
+                        hashtags.contains("#addtoblackskytravel") ||
+                        hashtags.contains("#blackskytravel") ||
+                        hashtags.contains("#addtoblackmedsky") ||
+                        hashtags.contains("#blackmedsky") ||
+                        hashtags.contains("#addtoblackedusky") ||
+                        hashtags.contains("#blackedusky")) &&
                         !is_blocked &&
                         !hashtags.contains("#private") &&
-                        !hashtags.contains("#nofeed") && 
+                        !hashtags.contains("#nofeed") &&
                         !hashtags.contains("#removefromblacksky") &&
                         !contains_explicit_slurs(post_text_original.as_str()) {
                         let uri_ = &new_post.uri;
                         let seq_ = &new_post.sequence;
-                        println!("Sequence: {seq_:?} | Uri: {uri_:?} | Member: {is_member:?} | Hashtags: {hashtags:?}");
+                        println!("Sequence: {seq_:?} | Uri: {uri_:?} | Member: {member_of:?} | Hashtags: {hashtags:?}");
 
                         let new_post = (
                             PostSchema::uri.eq(new_post.uri),
@@ -753,13 +752,14 @@ pub async fn queue_creation(
                             PostSchema::quoteCid.eq(new_post.quote_cid),
                             PostSchema::quoteUri.eq(new_post.quote_uri),
                             PostSchema::createdAt.eq(new_post.created_at),
+                            PostSchema::labels.eq(new_post.labels),
                         );
                         new_posts.push(new_post);
                         new_images.extend(post_images);
                         new_videos.extend(post_videos);
 
-                        if hashtags.contains("#addtoblacksky") && !is_member {
-                            println!("New member: {:?}", &req.author);
+                        if hashtags.contains("#addtoblacksky") && !member_of.contains(&"blacksky".to_string()) {
+                            println!("New Blacksky member: {:?}", &req.author);
                             let new_member = (
                                 MembershipSchema::did.eq(req.author.clone()),
                                 MembershipSchema::included.eq(true),
@@ -768,9 +768,39 @@ pub async fn queue_creation(
                             );
                             new_members.push(new_member);
                         }
-
-                        if hashtags.contains("#addtoblacksky") && 
-                            is_member &&
+                        if hashtags.contains("#addtoblackskytravel") && !member_of.contains(&"blacksky-travel".to_string()) {
+                            println!("New BlackskyTravel member: {:?}", &req.author);
+                            let new_member = (
+                                MembershipSchema::did.eq(req.author.clone()),
+                                MembershipSchema::included.eq(true),
+                                MembershipSchema::excluded.eq(false),
+                                MembershipSchema::list.eq("blacksky-travel")
+                            );
+                            new_members.push(new_member);
+                        }
+                        if hashtags.contains("#addtoblackmedsky") && !member_of.contains(&"blacksky-med".to_string()) {
+                            println!("New BlackMedSky member: {:?}", &req.author);
+                            let new_member = (
+                                MembershipSchema::did.eq(req.author.clone()),
+                                MembershipSchema::included.eq(true),
+                                MembershipSchema::excluded.eq(false),
+                                MembershipSchema::list.eq("blacksky-med")
+                            );
+                            new_members.push(new_member);
+                        }
+                        if hashtags.contains("#addtoblackedusky") && !member_of.contains(&"blacksky-scholastic".to_string()) {
+                            println!("New BlackEduSky member: {:?}", &req.author);
+                            let new_member = (
+                                MembershipSchema::did.eq(req.author.clone()),
+                                MembershipSchema::included.eq(true),
+                                MembershipSchema::excluded.eq(false),
+                                MembershipSchema::list.eq("blacksky-scholastic")
+                            );
+                            new_members.push(new_member);
+                        }
+                        /* TEMP REMOVING THIS FEATURE AS IT'S CREATING SPAM
+                        if hashtags.contains("#addtoblacksky") &&
+                            !member_of.is_empty() &&
                             !root_author.is_empty() {
                             println!("New member: {:?}", &root_author);
                             let new_member = (
@@ -780,9 +810,9 @@ pub async fn queue_creation(
                                 MembershipSchema::list.eq("blacksky")
                             );
                             new_members.push(new_member);
-                        }
+                        }*/
                     }
-                    if is_member &&
+                    if !member_of.is_empty() &&
                         hashtags.contains("#removefromblacksky") {
                         println!("Removing member: {:?}", &req.author);
                         members_to_rm.push(req.author.clone());
@@ -798,38 +828,44 @@ pub async fn queue_creation(
                 })
                 .for_each(drop);
 
-            diesel::insert_into(PostSchema::post)
-                .values(&new_posts)
-                .on_conflict(PostSchema::uri)
-                .do_nothing()
-                .execute(conn)
-                .expect("Error inserting post records");
-
-            diesel::insert_into(ImageSchema::image)
-                .values(&new_images)
-                .on_conflict(ImageSchema::cid)
-                .do_nothing()
-                .execute(conn)
-                .expect("Error inserting image records");
-
-            diesel::insert_into(VideoSchema::video)
-                .values(&new_videos)
-                .on_conflict(VideoSchema::cid)
-                .do_nothing()
-                .execute(conn)
-                .expect("Error inserting video records");
-
-            diesel::insert_into(MembershipSchema::membership)
-                .values(&new_members)
-                .on_conflict((MembershipSchema::did,MembershipSchema::list))
-                .do_nothing()
-                .execute(conn)
-                .expect("Error inserting member records");
-
-            diesel::delete(MembershipSchema::membership
-                .filter(MembershipSchema::did.eq_any(&members_to_rm)))
-                .execute(conn)
-                .expect("Error deleting member records");
+            if !new_posts.is_empty() {
+                diesel::insert_into(PostSchema::post)
+                    .values(&new_posts)
+                    .on_conflict(PostSchema::uri)
+                    .do_nothing()
+                    .execute(conn)
+                    .expect("Error inserting post records");
+            }
+            if !new_images.is_empty() {
+                diesel::insert_into(ImageSchema::image)
+                    .values(&new_images)
+                    .on_conflict(ImageSchema::cid)
+                    .do_nothing()
+                    .execute(conn)
+                    .expect("Error inserting image records");
+            }
+            if !new_videos.is_empty() {
+                diesel::insert_into(VideoSchema::video)
+                    .values(&new_videos)
+                    .on_conflict(VideoSchema::cid)
+                    .do_nothing()
+                    .execute(conn)
+                    .expect("Error inserting video records");
+            }
+            if !new_members.is_empty() {
+                diesel::insert_into(MembershipSchema::membership)
+                    .values(&new_members)
+                    .on_conflict((MembershipSchema::did,MembershipSchema::list))
+                    .do_nothing()
+                    .execute(conn)
+                    .expect("Error inserting member records");
+            }
+            if !members_to_rm.is_empty() {
+                diesel::delete(MembershipSchema::membership
+                    .filter(MembershipSchema::did.eq_any(&members_to_rm)))
+                    .execute(conn)
+                    .expect("Error deleting member records");
+            }
             Ok(())
         } else if lex == "likes" {
             let mut new_likes = Vec::new();
@@ -837,10 +873,10 @@ pub async fn queue_creation(
             body
                 .into_iter()
                 .map(|req| {
-                    if let Lexicon::AppBskyFeedLike(like_record) = req.record {
+                    if let CreateRecord::Lexicon(AppBskyFeedLike(like_record)) = req.record {
                         let subject_author: &String = &like_record.subject.uri[5..37].into(); // parse DID:PLC from URI
-                        let is_member = is_included(vec![&req.author, subject_author].into(), conn).unwrap_or(false);
-                        if is_member {
+                        let member_of = is_included(vec![&req.author, subject_author].into(), conn).unwrap_or_else(|_| vec![]);
+                        if !member_of.is_empty() {
                             let system_time = SystemTime::now();
                             let dt: DateTime<UtcOffset> = system_time.into();
                             let new_like = (
@@ -859,14 +895,14 @@ pub async fn queue_creation(
                     }
                 })
                 .for_each(drop);
-
-            diesel::insert_into(LikeSchema::like)
-                .values(&new_likes)
-                .on_conflict(LikeSchema::uri)
-                .do_nothing()
-                .execute(conn)
-                .expect("Error inserting like records");
-
+            if !new_likes.is_empty() {
+                diesel::insert_into(LikeSchema::like)
+                    .values(&new_likes)
+                    .on_conflict(LikeSchema::uri)
+                    .do_nothing()
+                    .execute(conn)
+                    .expect("Error inserting like records");
+            }
             Ok(())
         } else if lex == "follows" {
             let mut new_follows = Vec::new();
@@ -874,9 +910,9 @@ pub async fn queue_creation(
             body
                 .into_iter()
                 .map(|req| {
-                    if let Lexicon::AppBskyFeedFollow(follow_record) = req.record {
-                        let is_member = is_included(vec![&req.author, &follow_record.subject].into(), conn).unwrap_or(false);
-                        if is_member {
+                    if let CreateRecord::Lexicon(AppBskyFeedFollow(follow_record)) = req.record {
+                        let member_of = is_included(vec![&req.author, &follow_record.subject].into(), conn).unwrap_or_else(|_| vec![]);
+                        if !member_of.is_empty() {
                             let system_time = SystemTime::now();
                             let dt: DateTime<UtcOffset> = system_time.into();
                             let new_follow = (
@@ -894,14 +930,39 @@ pub async fn queue_creation(
                     }
                 })
                 .for_each(drop);
-
-            diesel::insert_into(FollowSchema::follow)
-                .values(&new_follows)
-                .on_conflict(FollowSchema::uri)
-                .do_nothing()
-                .execute(conn)
-                .expect("Error inserting like records");
-
+            if !new_follows.is_empty() {
+                diesel::insert_into(FollowSchema::follow)
+                    .values(&new_follows)
+                    .on_conflict(FollowSchema::uri)
+                    .do_nothing()
+                    .execute(conn)
+                    .expect("Error inserting like records");
+            }
+            Ok(())
+        } else if lex == "labels" {
+            body
+                .into_iter()
+                .map(|req| {
+                    if let CreateRecord::Label(label) = req.record {
+                        // @TODO: Handle account-level labels; Maybe put label on membership
+                        if req.uri.starts_with("did:plc:") {
+                            ()
+                        } else {
+                            // Raw SQL query
+                            let updated_rows = sql_query(
+                                "UPDATE post SET labels = labels || $1 WHERE uri = $2"
+                            )
+                                .bind::<Array<Nullable<Text>>, _>(vec![Some(&label.val)])
+                                .bind::<Text, _>(&req.uri)
+                                .execute(conn)
+                                .expect("Error updating labels");
+                            if updated_rows > 0 {
+                                println!("@LOG: applied {} to {}", label.val, req.uri);
+                            }
+                        }
+                    }
+                })
+                .for_each(drop);
             Ok(())
         } else {
             Err(format!("Unknown lexicon received {lex:?}"))

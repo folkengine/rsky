@@ -93,6 +93,7 @@ diesel::table! {
         quoteCid -> Nullable<Varchar>,
         quoteUri -> Nullable<Varchar>,
         createdAt -> Varchar,
+        labels -> Array<Nullable<Text>>,
     }
 }
 

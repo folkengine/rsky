@@ -11,8 +11,11 @@ use serde::Deserialize;
 use std::env;
 use std::io::Cursor;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::{thread, time::Duration};
 use tokio::net::TcpStream;
+use tokio::sync::Semaphore;
+use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use url::Url;
@@ -89,8 +92,8 @@ async fn update_cursor(
 async fn process(message: Vec<u8>, client: &reqwest::Client) {
     let default_queue_path =
         env::var("FEEDGEN_QUEUE_ENDPOINT").unwrap_or("https://[::1]:8081".into());
-    let default_subscriber_path =
-        env::var("FEEDGEN_SUBSCRIPTION_ENDPOINT").unwrap_or("wss://bsky.social".into());
+    let subscriber_base_path =
+        env::var("FEEDGEN_SUBSCRIPTION_PATH").unwrap_or("wss://bsky.network".into());
 
     match rsky_firehose::firehose::read(&message) {
         Ok((_header, body)) => {
@@ -106,12 +109,15 @@ async fn process(message: Vec<u8>, client: &reqwest::Client) {
                     if commit.ops.is_empty() {
                         println!("Operations empty.");
                     }
+                    if commit.too_big {
+                        println!("Too big.");
+                    }
                     // update stored cursor every 20 events or so
                     if (&commit.seq).rem_euclid(20) == 0 {
                         let cursor_endpoint = format!("{}/cursor", default_queue_path);
                         let resp = update_cursor(
                             cursor_endpoint,
-                            default_subscriber_path,
+                            subscriber_base_path,
                             &commit.seq,
                             client,
                         )
@@ -269,42 +275,161 @@ async fn process(message: Vec<u8>, client: &reqwest::Client) {
     }
 }
 
+async fn process_labels(message: Vec<u8>, client: &reqwest::Client) {
+    let default_queue_path =
+        env::var("FEEDGEN_QUEUE_ENDPOINT").unwrap_or("https://[::1]:8081".into());
+    let subscriber_base_path =
+        env::var("FEEDGEN_SUBSCRIPTION_PATH").unwrap_or("wss://bsky.network".into());
+
+    match rsky_firehose::firehose::read_labels(&message) {
+        Ok((_header, body)) => {
+            let mut labels_to_create = Vec::new();
+
+            // update stored cursor every 20 events or so
+            if (&body.seq).rem_euclid(20) == 0 {
+                let cursor_endpoint = format!("{}/cursor", default_queue_path);
+                let resp =
+                    update_cursor(cursor_endpoint, subscriber_base_path, &body.seq, client).await;
+                match resp {
+                    Ok(()) => (),
+                    Err(error) => eprintln!("@LOG: Failed to update cursor: {error:?}"),
+                };
+            }
+            body.labels
+                .into_iter()
+                .filter(|label| {
+                    label.uri.contains("app.bsky.feed.post") || label.uri.starts_with("did:plc:")
+                })
+                .map(|label| {
+                    let create = rsky_firehose::models::CreateOp {
+                        uri: label.uri.clone(),
+                        cid: match label.cid {
+                            None => "".to_string(),
+                            Some(ref cid) => cid.clone(),
+                        },
+                        sequence: body.seq,
+                        prev: None,
+                        author: label.src.clone(),
+                        record: label,
+                    };
+                    labels_to_create.push(create);
+                })
+                .for_each(drop);
+            if labels_to_create.len() > 0 {
+                let queue_endpoint = format!("{}/queue/{}/create", default_queue_path, "labels");
+                let resp = queue_create(queue_endpoint, labels_to_create, client).await;
+                match resp {
+                    Ok(()) => (),
+                    Err(error) => eprintln!("Records failed to queue: {error:?}"),
+                };
+            }
+        }
+        Err(error) => eprintln!(
+            "@LOG: Error unwrapping message and header: {}",
+            error.to_string()
+        ),
+    }
+}
+
 #[tokio::main]
 async fn main() {
-    match dotenvy::dotenv() {
-        _ => (),
-    };
+    // Load environment variables from .env file
+    dotenv().ok();
 
-    let default_subscriber_path =
-        env::var("FEEDGEN_SUBSCRIPTION_ENDPOINT").unwrap_or("wss://bsky.social".into());
-    let client = reqwest::Client::new();
+    // Retrieve the subscription endpoint from environment variables or use default
+    let subscriber_base_path =
+        env::var("FEEDGEN_SUBSCRIPTION_PATH").unwrap_or_else(|_| "wss://bsky.network".to_string());
+    let subscriber_endpoint = env::var("FEEDGEN_SUBSCRIPTION_ENDPOINT")
+        .unwrap_or_else(|_| "com.atproto.sync.subscribeRepos".to_string());
+
+    // Configure the reqwest client with connection pooling settings
+    let client = Arc::new(
+        reqwest::Client::builder()
+            .pool_max_idle_per_host(10) // Max idle connections per host
+            .pool_idle_timeout(Duration::from_secs(30)) // Idle timeout
+            .timeout(Duration::from_secs(10)) // Request timeout
+            .build()
+            .expect("Failed to build reqwest client"),
+    );
+
+    // Create a semaphore to limit the number of concurrent processing tasks
+    let semaphore = Arc::new(Semaphore::new(100)); // Adjust the limit as needed
+
     loop {
-        match tokio_tungstenite::connect_async(
-            Url::parse(
-                format!(
-                    "{}/xrpc/com.atproto.sync.subscribeRepos",
-                    default_subscriber_path
-                )
-                .as_str(),
-            )
-            .unwrap(),
-        )
-        .await
-        {
+        // Construct the WebSocket URL
+        let url = format!("{}/xrpc/{}", subscriber_base_path, subscriber_endpoint);
+        let ws_url = Url::parse(&url).expect("Invalid WebSocket URL");
+
+        // Attempt to establish a WebSocket connection
+        match connect_async(ws_url).await {
             Ok((mut socket, _response)) => {
-                println!("Connected to {default_subscriber_path:?}.");
-                while let Some(Ok(Message::Binary(message))) = socket.next().await {
-                    let client = client.clone();
-                    tokio::spawn(async move {
-                        process(message, &client).await;
-                    });
+                println!("Connected to {}", subscriber_base_path);
+
+                // Listen for incoming messages
+                while let Some(msg_result) = socket.next().await {
+                    match msg_result {
+                        Ok(Message::Binary(message)) => {
+                            let client = Arc::clone(&client);
+                            let semaphore = Arc::clone(&semaphore);
+
+                            // Acquire a permit before spawning a new task
+                            let permit = match semaphore.clone().acquire_owned().await {
+                                Ok(permit) => permit,
+                                Err(_) => {
+                                    eprintln!("Semaphore closed");
+                                    break;
+                                }
+                            };
+
+                            // Spawn a new asynchronous task to process the message
+                            tokio::spawn(async move {
+                                // The permit is held for the duration of the task
+                                let subscriber_endpoint = env::var("FEEDGEN_SUBSCRIPTION_ENDPOINT")
+                                    .unwrap_or_else(|_| {
+                                        "com.atproto.sync.subscribeRepos".to_string()
+                                    });
+
+                                match subscriber_endpoint.as_str() {
+                                    "com.atproto.sync.subscribeRepos" => {
+                                        process(message, &client).await
+                                    }
+                                    "com.atproto.label.subscribeLabels" => {
+                                        process_labels(message, &client).await
+                                    }
+                                    _ => panic!(
+                                        "Unexpected subscription endpoint: {subscriber_endpoint}"
+                                    ),
+                                };
+                                // Permit is automatically released when it goes out of scope
+                                drop(permit);
+                            });
+                        }
+                        Ok(Message::Close(_)) => {
+                            println!("WebSocket connection closed by server.");
+                            break;
+                        }
+                        Ok(_) => {
+                            // Handle other message types if necessary
+                        }
+                        Err(e) => {
+                            eprintln!("WebSocket error: {}", e);
+                            break;
+                        }
+                    }
                 }
             }
             Err(error) => {
-                eprintln!("Error connecting to {default_subscriber_path:?}. Waiting to reconnect: {error:?}");
-                thread::sleep(Duration::from_millis(500));
+                eprintln!(
+                    "Error connecting to {}. Waiting to reconnect: {:?}",
+                    subscriber_base_path, error
+                );
+                // Use asynchronous sleep to avoid blocking the thread
+                tokio::time::sleep(Duration::from_millis(500)).await;
                 continue;
             }
         }
+
+        // Optionally, wait before attempting to reconnect
+        tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }
